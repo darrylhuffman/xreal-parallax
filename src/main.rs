@@ -40,6 +40,8 @@ struct GpuState {
     panel_resources: Vec<PanelGpuResources>,
     camera: Camera,
     captures: Vec<xreal_capture::duplication::DxgiCapture>,
+    /// Depth texture for mono rendering (matches window size, not eye size).
+    mono_depth: wgpu::TextureView,
     frame_count: u64,
 }
 
@@ -179,6 +181,8 @@ impl ApplicationHandler for App {
 
         let camera = Camera::new();
 
+        let mono_depth = create_depth_texture(&device, win_size.width, win_size.height);
+
         self.gpu = Some(GpuState {
             device,
             queue,
@@ -189,6 +193,7 @@ impl ApplicationHandler for App {
             panel_resources,
             camera,
             captures,
+            mono_depth,
             frame_count: 0,
         });
 
@@ -217,12 +222,16 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Resized(size) => {
-                if let Some(gpu) = &mut self.gpu {
-                    gpu.surface_config.width = size.width;
-                    gpu.surface_config.height = size.height;
-                    gpu.surface.configure(&gpu.device, &gpu.surface_config);
-                    self.interaction
-                        .set_window_size(size.width as f32, size.height as f32);
+                if size.width > 0 && size.height > 0 {
+                    if let Some(gpu) = &mut self.gpu {
+                        gpu.surface_config.width = size.width;
+                        gpu.surface_config.height = size.height;
+                        gpu.surface.configure(&gpu.device, &gpu.surface_config);
+                        gpu.mono_depth =
+                            create_depth_texture(&gpu.device, size.width, size.height);
+                        self.interaction
+                            .set_window_size(size.width as f32, size.height as f32);
+                    }
                 }
             }
 
@@ -337,6 +346,9 @@ impl ApplicationHandler for App {
                             .texture
                             .create_view(&wgpu::TextureViewDescriptor::default());
 
+                        // Use actual window aspect ratio for mono mode.
+                        gpu.camera.aspect_ratio = gpu.surface_config.width as f32
+                            / gpu.surface_config.height as f32;
                         let projection = gpu.camera.projection_matrix();
                         let view_matrix = gpu.camera.view_matrix();
 
@@ -367,7 +379,7 @@ impl ApplicationHandler for App {
                                     )],
                                     depth_stencil_attachment: Some(
                                         wgpu::RenderPassDepthStencilAttachment {
-                                            view: &gpu.stereo.render_pipeline.depth_texture,
+                                            view: &gpu.mono_depth,
                                             depth_ops: Some(wgpu::Operations {
                                                 load: wgpu::LoadOp::Clear(1.0),
                                                 store: wgpu::StoreOp::Store,
@@ -482,6 +494,24 @@ fn apply_panel_action(gpu: &mut Option<GpuState>, (panel_id, action): (u32, Pane
             }
         }
     }
+}
+
+fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("mono_depth_texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 #[tokio::main]
