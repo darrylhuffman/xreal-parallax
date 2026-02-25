@@ -1,0 +1,29 @@
+
+/target/
+
+## File system
+.DS_Store
+desktop.ini
+
+## Editor
+*.swp
+*.swo
+Session.vim
+.cproject
+.idea
+*.iml
+.vscode
+.project
+.vim/
+.helix/
+.zed/
+.favorites.json
+CLAUDE.md
+.claude
+.settings/
+.vs/
+.dir-locals.el
+
+## direnv
+/.envrc
+/.direnv/

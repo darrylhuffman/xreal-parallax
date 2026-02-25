@@ -1,0 +1,11 @@
+[package]
+name = "xreal-input"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+xreal-config = { path = "../xreal-config" }
+glam = { workspace = true }
+winit = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,47 @@
+# XReal Multi-Monitor AR Workspace — Default Configuration
+
+ipd_mm = 63.0
+virtual_monitor_count = 4
+
+[imu]
+madgwick_beta = 0.1
+calibration_samples = 500
+
+[layout]
+preset = "CurvedArc"
+
+[[layout.panels]]
+id = 0
+resolution = [1920, 1080]
+position = [-1.4, 0.0, -2.1]
+rotation = [0.0, 0.26, 0.0, 0.97]
+scale = [1.2, 0.675]
+curvature = 0.15
+curve_segments = 32
+
+[[layout.panels]]
+id = 1
+resolution = [1920, 1080]
+position = [-0.47, 0.0, -2.45]
+rotation = [0.0, 0.09, 0.0, 0.996]
+scale = [1.2, 0.675]
+curvature = 0.15
+curve_segments = 32
+
+[[layout.panels]]
+id = 2
+resolution = [1920, 1080]
+position = [0.47, 0.0, -2.45]
+rotation = [0.0, -0.09, 0.0, 0.996]
+scale = [1.2, 0.675]
+curvature = 0.15
+curve_segments = 32
+
+[[layout.panels]]
+id = 3
+resolution = [1920, 1080]
+position = [1.4, 0.0, -2.1]
+rotation = [0.0, -0.26, 0.0, 0.97]
+scale = [1.2, 0.675]
+curvature = 0.15
+curve_segments = 32

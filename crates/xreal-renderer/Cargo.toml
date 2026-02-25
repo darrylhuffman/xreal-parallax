@@ -1,0 +1,17 @@
+[package]
+name = "xreal-renderer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+xreal-config = { path = "../xreal-config" }
+wgpu = { workspace = true }
+winit = { workspace = true }
+glam = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytemuck = { version = "1", features = ["derive"] }

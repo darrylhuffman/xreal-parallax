@@ -1,0 +1,14 @@
+[package]
+name = "xreal-imu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+glam = { workspace = true }
+ahrs = { workspace = true }
+nalgebra = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+byteorder = { workspace = true }
