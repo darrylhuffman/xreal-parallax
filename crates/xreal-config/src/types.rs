@@ -120,9 +120,10 @@ impl PanelConfig {
                 let z = -radius * angle.cos();
                 let position = Vec3::new(x, 0.0, z);
 
-                // Face toward the user (origin)
+                // Face toward the user (origin).
+                // Panel mesh front face has +Z normal, so rotate +Z to point at user.
                 let look_dir = -position.normalize();
-                let rotation = Quat::from_rotation_arc(Vec3::NEG_Z, look_dir);
+                let rotation = Quat::from_rotation_arc(Vec3::Z, look_dir);
 
                 PanelConfig {
                     id: i,

@@ -34,9 +34,15 @@ impl ImuClient {
     /// Connect to the XReal One IMU and start processing.
     pub async fn connect(madgwick_beta: f32, calibration_samples: u32) -> Result<Self> {
         let addr = format!("{}:{}", XREAL_ONE_ADDR.0, XREAL_ONE_ADDR.1);
-        tracing::info!(%addr, "Connecting to XReal One IMU");
+        tracing::info!(%addr, "Connecting to XReal One IMU (3s timeout)");
 
-        let stream = TcpStream::connect(&addr).await?;
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("IMU connection timed out after 3s"))?
+        ?;
         tracing::info!("Connected to XReal One IMU");
 
         let (orientation_tx, orientation_rx) = watch::channel(Orientation::default());

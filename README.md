@@ -55,7 +55,7 @@ git clone https://github.com/YOUR_USERNAME/xreal-parallax.git
 cd xreal-parallax
 cargo build --release
 
-# Run (works without glasses — uses mock head tracking)
+# Run (works without glasses — head tracking activates automatically when connected)
 cargo run --release
 ```
 
