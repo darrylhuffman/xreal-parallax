@@ -65,16 +65,49 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Create window. In stereo mode this would be fullscreen 3840x1080 on the glasses.
-        let size = if self.stereo_mode {
-            PhysicalSize::new(3840, 1080)
+        // Try to find the XReal One display (3840x1080 or 1920x1080 at high refresh).
+        let xreal_monitor = event_loop.available_monitors().find(|m| {
+            let size = m.size();
+            let name = m.name().unwrap_or_default();
+            let is_xreal = size.width == 3840 && size.height == 1080;
+            let looks_like_xreal =
+                name.to_lowercase().contains("xreal") || (size.width == 1920 && size.height == 1080);
+            if is_xreal {
+                info!(
+                    name = name,
+                    width = size.width,
+                    height = size.height,
+                    "Found XReal display (SBS mode)"
+                );
+            }
+            is_xreal
+        });
+
+        let (attrs, detected_stereo) = if let Some(ref monitor) = xreal_monitor {
+            // Fullscreen borderless on the XReal display.
+            info!("Going fullscreen on XReal display");
+            (
+                Window::default_attributes()
+                    .with_title("XReal Parallax")
+                    .with_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(
+                        monitor.clone(),
+                    )))),
+                true,
+            )
         } else {
-            PhysicalSize::new(1920, 1080)
+            // Windowed mode for development.
+            info!("XReal display not detected, running in windowed mode");
+            (
+                Window::default_attributes()
+                    .with_title("XReal Parallax")
+                    .with_inner_size(PhysicalSize::new(1920u32, 1080u32)),
+                false,
+            )
         };
 
-        let attrs = Window::default_attributes()
-            .with_title("XReal Multi-Monitor")
-            .with_inner_size(size);
+        if detected_stereo {
+            self.stereo_mode = true;
+        }
 
         let window = Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
         self.window = Some(window.clone());
