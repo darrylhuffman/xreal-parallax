@@ -124,7 +124,16 @@ pub fn connect_usb() -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
         match try_connect(&device, candidate) {
             Ok(rx) => return Ok(rx),
             Err(e) => {
-                tracing::warn!("  {} failed: {e:#}", mode_name);
+                if candidate.mode == FramingMode::Ncm {
+                    tracing::warn!(
+                        "  NCM failed: {e:#}. \
+                         The IMU service lives on the NCM interface. \
+                         In Zadig, replace the driver on \"CDC NCM (Interface 1)\" \
+                         from UsbNcm → WinUSB, then restart."
+                    );
+                } else {
+                    tracing::warn!("  {} failed: {e:#}", mode_name);
+                }
                 last_err = e;
             }
         }
@@ -609,7 +618,9 @@ fn ecm_tcp_thread(
             let rx = counters.rx.load(Ordering::Relaxed);
             let tx = counters.tx.load(Ordering::Relaxed);
             return Err(anyhow!(
-                "TCP timed out ({TCP_CONNECT_TIMEOUT:?}). USB: {tx} TX, {rx} RX."
+                "TCP timed out ({TCP_CONNECT_TIMEOUT:?}). USB: {tx} TX, {rx} RX. \
+                 If running on the ECM fallback interface, the IMU only responds on NCM. \
+                 In Zadig, replace the driver on \"CDC NCM (Interface 1)\" from UsbNcm → WinUSB."
             ));
         }
 
