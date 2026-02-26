@@ -1,14 +1,18 @@
-//! CDC ECM transport for XReal One IMU over raw USB.
+//! CDC ECM/NCM transport for XReal One IMU over raw USB.
 //!
-//! Windows lacks a built-in CDC ECM driver (only CDC NCM via UsbNcm.sys).
-//! This module bypasses that entirely:
+//! Windows lacks built-in CDC ECM support and the NCM driver (UsbNcm.sys)
+//! fails for this device. This module bypasses all OS drivers:
 //!
 //! 1. Opens the XReal One USB device directly via WinUSB (nusb)
-//! 2. Speaks CDC ECM: raw Ethernet frames on bulk endpoints
+//! 2. Speaks CDC NCM or ECM to exchange Ethernet frames
 //! 3. Runs a user-space TCP/IP stack (smoltcp) over those frames
 //! 4. Establishes TCP to 169.254.2.1:52998 for IMU data
 //!
-//! Prerequisite: install WinUSB driver for the CDC ECM interface via Zadig.
+//! The XReal One exposes TWO network interfaces:
+//!   - Interface 1/2: CDC NCM (primary — IMU TCP service lives here)
+//!   - Interface 3/4: CDC ECM (secondary — IPv6 only)
+//!
+//! Prerequisite: install WinUSB driver for the network interfaces via Zadig.
 
 use anyhow::{anyhow, Result};
 use nusb::MaybeFuture;
@@ -39,7 +43,7 @@ const HOST_IP: [u8; 4] = [169, 254, 2, 2];
 /// Locally-administered MAC for our end of the link.
 const HOST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
-/// CDC ECM class request: SET_ETHERNET_PACKET_FILTER.
+/// CDC class request: SET_ETHERNET_PACKET_FILTER.
 const SET_ETHERNET_PACKET_FILTER: u8 = 0x43;
 
 /// Accept all packet types.
@@ -48,19 +52,25 @@ const PACKET_TYPE_ALL: u16 = 0x001F;
 /// Max Ethernet frame size.
 const MAX_FRAME_SIZE: usize = 1514;
 
+/// Max NTB (NCM Transfer Block) size for USB transfers.
+const MAX_NTB_SIZE: usize = 4096;
+
 /// TCP connection timeout.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Shared frame counters for diagnostics.
+/// Whether to use NCM framing (NTB headers) or raw ECM frames.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FramingMode {
+    Ncm,
+    Ecm,
+}
+
 struct FrameCounters {
     rx: AtomicU64,
     tx: AtomicU64,
 }
 
-/// Connect to the XReal One IMU via USB CDC ECM.
-///
-/// Returns a channel receiver yielding raw TCP data (IMU protocol bytes).
-/// Three background threads handle USB I/O and the TCP stack.
+/// Connect to the XReal One IMU via USB CDC NCM/ECM.
 pub fn connect_usb() -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
     // 1. Find the XReal One.
     let device_info = nusb::list_devices()
@@ -76,8 +86,6 @@ pub fn connect_usb() -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
         })?;
 
     tracing::info!(
-        vendor = format!("{:04x}", device_info.vendor_id()),
-        product = format!("{:04x}", device_info.product_id()),
         product_string = ?device_info.product_string(),
         "Found XReal One USB device"
     );
@@ -88,98 +96,121 @@ pub fn connect_usb() -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
         .wait()
         .map_err(|e| anyhow!("Failed to open USB device (is WinUSB installed via Zadig?): {e}"))?;
 
-    // 3. Dump all USB interfaces for diagnostics, then find CDC ECM.
+    // 3. Dump descriptors and discover interfaces.
     let config = device
         .active_configuration()
-        .map_err(|e| anyhow!("Failed to read USB configuration descriptor: {e}"))?;
+        .map_err(|e| anyhow!("Failed to read USB configuration: {e}"))?;
 
     dump_usb_descriptors(&config);
-    let ecm = find_ecm_endpoints(&config)?;
+    let all = find_all_network_interfaces(&config);
 
-    tracing::info!(
-        comm = ecm.comm_iface,
-        data = ecm.data_iface,
-        data_alt = ecm.data_alt_setting,
-        bulk_in = format!("0x{:02x}", ecm.bulk_in_ep),
-        bulk_out = format!("0x{:02x}", ecm.bulk_out_ep),
-        "Found CDC ECM endpoints"
-    );
+    // 4. Try NCM first (primary interface, where IMU service lives), then ECM.
+    let mut last_err = anyhow!("No network interfaces found");
 
-    // 4. Claim interfaces.
-    let comm = device
-        .claim_interface(ecm.comm_iface)
-        .wait()
-        .map_err(|e| anyhow!("Failed to claim Communication interface (install WinUSB via Zadig): {e}"))?;
+    for candidate in &all {
+        let mode_name = match candidate.mode {
+            FramingMode::Ncm => "NCM",
+            FramingMode::Ecm => "ECM",
+        };
+        tracing::info!(
+            mode = mode_name,
+            comm = candidate.comm_iface,
+            data = candidate.data_iface,
+            bulk_in = format!("0x{:02x}", candidate.bulk_in_ep),
+            bulk_out = format!("0x{:02x}", candidate.bulk_out_ep),
+            "Trying {} interface...", mode_name
+        );
 
-    let data = device
-        .claim_interface(ecm.data_iface)
-        .wait()
-        .map_err(|e| anyhow!("Failed to claim Data interface (install WinUSB via Zadig): {e}"))?;
-
-    // Always set alt setting 1 on the data interface — CDC ECM spec requires
-    // it to activate the bulk endpoints. Even if descriptors show endpoints
-    // at alt 0, the device may still need this control request.
-    tracing::info!("Activating CDC ECM data interface (alt setting 1)...");
-    match data.set_alt_setting(1).wait() {
-        Ok(()) => tracing::info!("Data interface alt setting 1 activated"),
-        Err(e) => tracing::warn!(?e, "set_alt_setting(1) failed, trying alt 0"),
+        match try_connect(&device, candidate) {
+            Ok(rx) => return Ok(rx),
+            Err(e) => {
+                tracing::warn!("  {} failed: {e:#}", mode_name);
+                last_err = e;
+            }
+        }
     }
 
-    // 5. Enable packet reception via SET_ETHERNET_PACKET_FILTER.
+    Err(last_err)
+}
+
+/// Try to establish IMU connection on a specific network interface.
+fn try_connect(
+    device: &nusb::Device,
+    iface: &NetworkInterface,
+) -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
+    let mode = iface.mode;
+
+    // Claim interfaces.
+    let comm = device
+        .claim_interface(iface.comm_iface)
+        .wait()
+        .map_err(|e| anyhow!("Failed to claim comm interface {}: {e}", iface.comm_iface))?;
+
+    let data = device
+        .claim_interface(iface.data_iface)
+        .wait()
+        .map_err(|e| anyhow!("Failed to claim data interface {}: {e}", iface.data_iface))?;
+
+    // Activate bulk endpoints (alt setting 1).
+    tracing::info!("  Activating data interface alt setting 1...");
+    data.set_alt_setting(1)
+        .wait()
+        .map_err(|e| anyhow!("  set_alt_setting(1) failed: {e}"))?;
+    tracing::info!("  Alt setting 1 activated");
+
+    // Enable packet filter.
     match comm.control_out(
         nusb::transfer::ControlOut {
             control_type: nusb::transfer::ControlType::Class,
             recipient: nusb::transfer::Recipient::Interface,
             request: SET_ETHERNET_PACKET_FILTER,
             value: PACKET_TYPE_ALL,
-            index: ecm.comm_iface as u16,
+            index: iface.comm_iface as u16,
             data: &[],
         },
         Duration::from_millis(1000),
     ).wait() {
-        Ok(()) => tracing::info!("SET_ETHERNET_PACKET_FILTER succeeded"),
-        Err(e) => tracing::warn!(?e, "SET_ETHERNET_PACKET_FILTER failed"),
+        Ok(()) => tracing::info!("  SET_ETHERNET_PACKET_FILTER succeeded"),
+        Err(e) => tracing::warn!("  SET_ETHERNET_PACKET_FILTER: {e}"),
     }
 
-    // 6. Create bulk endpoint reader/writer.
+    // Open bulk endpoints.
     let reader = data
-        .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(ecm.bulk_in_ep)
-        .map_err(|e| anyhow!("Failed to open bulk IN endpoint: {e}"))?
-        .reader(MAX_FRAME_SIZE);
+        .endpoint::<nusb::transfer::Bulk, nusb::transfer::In>(iface.bulk_in_ep)
+        .map_err(|e| anyhow!("Failed to open bulk IN: {e}"))?
+        .reader(MAX_NTB_SIZE);
 
     let writer = data
-        .endpoint::<nusb::transfer::Bulk, nusb::transfer::Out>(ecm.bulk_out_ep)
-        .map_err(|e| anyhow!("Failed to open bulk OUT endpoint: {e}"))?
-        .writer(MAX_FRAME_SIZE);
+        .endpoint::<nusb::transfer::Bulk, nusb::transfer::Out>(iface.bulk_out_ep)
+        .map_err(|e| anyhow!("Failed to open bulk OUT: {e}"))?
+        .writer(MAX_NTB_SIZE);
 
-    // 7. Spawn background threads with shared counters.
+    // Spawn threads.
     let counters = Arc::new(FrameCounters {
         rx: AtomicU64::new(0),
         tx: AtomicU64::new(0),
     });
 
     let (imu_tx, imu_rx) = mpsc::unbounded_channel();
-
-    // USB reader → frame channel
     let (frame_tx, frame_rx) = std_mpsc::channel::<Vec<u8>>();
-    let rx_counters = counters.clone();
+    let (write_tx, write_rx) = std_mpsc::channel::<Vec<u8>>();
+
+    let rx_cnt = counters.clone();
     std::thread::Builder::new()
         .name("xreal-usb-reader".into())
-        .spawn(move || usb_reader_thread(reader, frame_tx, rx_counters))?;
+        .spawn(move || usb_reader_thread(reader, frame_tx, rx_cnt, mode))?;
 
-    // Frame channel → USB writer
-    let (write_tx, write_rx) = std_mpsc::channel::<Vec<u8>>();
-    let tx_counters = counters.clone();
+    let tx_cnt = counters.clone();
     std::thread::Builder::new()
         .name("xreal-usb-writer".into())
-        .spawn(move || usb_writer_thread(writer, write_rx, tx_counters))?;
+        .spawn(move || usb_writer_thread(writer, write_rx, tx_cnt, mode))?;
 
-    // smoltcp TCP → IMU data channel
+    let tcp_cnt = counters.clone();
     std::thread::Builder::new()
         .name("xreal-ecm-tcp".into())
         .spawn(move || {
-            if let Err(e) = ecm_tcp_thread(frame_rx, write_tx, imu_tx, counters) {
-                tracing::error!(?e, "ECM TCP thread exited with error");
+            if let Err(e) = ecm_tcp_thread(frame_rx, write_tx, imu_tx, tcp_cnt) {
+                tracing::error!(?e, "TCP thread exited with error");
             }
         })?;
 
@@ -190,108 +221,199 @@ pub fn connect_usb() -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
 // Descriptor discovery
 // ---------------------------------------------------------------------------
 
-struct EcmEndpoints {
+struct NetworkInterface {
+    mode: FramingMode,
     comm_iface: u8,
     data_iface: u8,
-    data_alt_setting: u8,
     bulk_in_ep: u8,
     bulk_out_ep: u8,
 }
 
-/// Log all USB interfaces for debugging.
 fn dump_usb_descriptors(config: &nusb::descriptors::ConfigurationDescriptor) {
     tracing::info!("=== USB Descriptor Dump ===");
     for iface_desc in config.interface_alt_settings() {
-        let iface_num = iface_desc.interface_number();
-        let alt = iface_desc.alternate_setting();
-        let class = iface_desc.class();
-        let subclass = iface_desc.subclass();
-        let protocol = iface_desc.protocol();
-
-        let class_name = match (class, subclass) {
+        let class_name = match (iface_desc.class(), iface_desc.subclass()) {
             (0x02, 0x02) => "CDC ACM",
             (0x02, 0x06) => "CDC ECM",
             (0x02, 0x0D) => "CDC NCM",
-            (0x02, _) => "CDC Other",
             (0x0A, _) => "CDC Data",
             (0x0E, _) => "Video",
             (0x01, _) => "Audio",
-            (0xFF, _) => "Vendor-Specific",
+            (0x03, _) => "HID",
+            (0xFF, _) => "Vendor",
             _ => "Other",
         };
-
-        let mut ep_info = Vec::new();
-        for ep in iface_desc.endpoints() {
-            let dir = match ep.direction() {
-                nusb::transfer::Direction::In => "IN",
-                nusb::transfer::Direction::Out => "OUT",
-            };
+        let eps: Vec<String> = iface_desc.endpoints().map(|ep| {
+            let dir = if ep.direction() == nusb::transfer::Direction::In { "IN" } else { "OUT" };
             let tt = match ep.transfer_type() {
-                nusb::descriptors::TransferType::Control => "ctrl",
-                nusb::descriptors::TransferType::Isochronous => "iso",
                 nusb::descriptors::TransferType::Bulk => "bulk",
                 nusb::descriptors::TransferType::Interrupt => "int",
+                nusb::descriptors::TransferType::Isochronous => "iso",
+                nusb::descriptors::TransferType::Control => "ctrl",
             };
-            ep_info.push(format!("0x{:02x} {} {}", ep.address(), dir, tt));
-        }
-
+            format!("0x{:02x} {} {}", ep.address(), dir, tt)
+        }).collect();
         tracing::info!(
-            iface = iface_num,
-            alt,
-            class = format!("{:02x}/{:02x}/{:02x}", class, subclass, protocol),
-            name = class_name,
-            endpoints = ?ep_info,
-            "  Interface"
+            "  iface={} alt={} class={:02x}/{:02x} {} eps={:?}",
+            iface_desc.interface_number(),
+            iface_desc.alternate_setting(),
+            iface_desc.class(),
+            iface_desc.subclass(),
+            class_name,
+            eps,
         );
     }
     tracing::info!("=== End Descriptor Dump ===");
 }
 
-fn find_ecm_endpoints(config: &nusb::descriptors::ConfigurationDescriptor) -> Result<EcmEndpoints> {
-    let mut comm_iface = None;
-    let mut data_iface = None;
-    let mut bulk_in = None;
-    let mut bulk_out = None;
-    let mut data_alt = 0u8;
+/// Find all CDC network interfaces (NCM first, then ECM).
+fn find_all_network_interfaces(
+    config: &nusb::descriptors::ConfigurationDescriptor,
+) -> Vec<NetworkInterface> {
+    let mut ncm_comm = Vec::new();
+    let mut ecm_comm = Vec::new();
+    let mut data_ifaces: Vec<(u8, u8, u8, u8)> = Vec::new(); // (iface_num, alt, bulk_in, bulk_out)
 
     for iface_desc in config.interface_alt_settings() {
         let class = iface_desc.class();
         let subclass = iface_desc.subclass();
         let iface_num = iface_desc.interface_number();
-        let alt = iface_desc.alternate_setting();
 
-        // CDC Communication: class 0x02, subclass 0x06 (ECM) or 0x0D (NCM)
-        if class == 0x02 && (subclass == 0x06 || subclass == 0x0D) {
-            comm_iface = Some(iface_num);
+        if class == 0x02 && subclass == 0x0D {
+            ncm_comm.push(iface_num);
+        }
+        if class == 0x02 && subclass == 0x06 {
+            ecm_comm.push(iface_num);
         }
 
-        // CDC Data: class 0x0A — look for bulk endpoints
         if class == 0x0A {
+            let mut bin = 0u8;
+            let mut bout = 0u8;
             for ep in iface_desc.endpoints() {
-                if ep.transfer_type() != nusb::descriptors::TransferType::Bulk {
-                    continue;
-                }
-                match ep.direction() {
-                    nusb::transfer::Direction::In => {
-                        bulk_in = Some(ep.address());
-                        data_iface = Some(iface_num);
-                        data_alt = alt;
-                    }
-                    nusb::transfer::Direction::Out => {
-                        bulk_out = Some(ep.address());
+                if ep.transfer_type() == nusb::descriptors::TransferType::Bulk {
+                    match ep.direction() {
+                        nusb::transfer::Direction::In => bin = ep.address(),
+                        nusb::transfer::Direction::Out => bout = ep.address(),
                     }
                 }
+            }
+            if bin != 0 && bout != 0 {
+                data_ifaces.push((iface_num, iface_desc.alternate_setting(), bin, bout));
             }
         }
     }
 
-    Ok(EcmEndpoints {
-        comm_iface: comm_iface.ok_or_else(|| anyhow!("No CDC ECM Communication interface found"))?,
-        data_iface: data_iface.ok_or_else(|| anyhow!("No CDC Data interface with bulk endpoints"))?,
-        bulk_in_ep: bulk_in.ok_or_else(|| anyhow!("No bulk IN endpoint found"))?,
-        bulk_out_ep: bulk_out.ok_or_else(|| anyhow!("No bulk OUT endpoint found"))?,
-        data_alt_setting: data_alt,
-    })
+    let mut result = Vec::new();
+
+    // NCM interfaces first (primary, where IMU service lives).
+    for &comm in &ncm_comm {
+        // Data interface is typically comm + 1.
+        if let Some(&(di, _, bin, bout)) = data_ifaces.iter().find(|(n, _, _, _)| *n == comm + 1) {
+            result.push(NetworkInterface {
+                mode: FramingMode::Ncm,
+                comm_iface: comm,
+                data_iface: di,
+                bulk_in_ep: bin,
+                bulk_out_ep: bout,
+            });
+        }
+    }
+
+    // ECM interfaces as fallback.
+    for &comm in &ecm_comm {
+        if let Some(&(di, _, bin, bout)) = data_ifaces.iter().find(|(n, _, _, _)| *n == comm + 1) {
+            result.push(NetworkInterface {
+                mode: FramingMode::Ecm,
+                comm_iface: comm,
+                data_iface: di,
+                bulk_in_ep: bin,
+                bulk_out_ep: bout,
+            });
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// NCM Transfer Block (NTB) framing
+// ---------------------------------------------------------------------------
+
+/// Wrap a single Ethernet frame in an NCM NTB16 for transmission.
+fn ncm_wrap_frame(frame: &[u8], sequence: u16) -> Vec<u8> {
+    let ndp_offset: u16 = 12; // NDP immediately after NTH16
+    // NDP16: signature(4) + length(2) + next_ndp(2) + 1 entry(4) + terminator(4) = 16
+    let ndp_len: u16 = 16;
+    let datagram_offset = ndp_offset + ndp_len;
+    let block_length = datagram_offset + frame.len() as u16;
+
+    let mut ntb = Vec::with_capacity(block_length as usize);
+
+    // NTH16 (12 bytes)
+    ntb.extend_from_slice(b"NCMH");                         // dwSignature
+    ntb.extend_from_slice(&12u16.to_le_bytes());             // wHeaderLength
+    ntb.extend_from_slice(&sequence.to_le_bytes());          // wSequence
+    ntb.extend_from_slice(&block_length.to_le_bytes());      // wBlockLength
+    ntb.extend_from_slice(&ndp_offset.to_le_bytes());        // wNdpIndex
+
+    // NDP16 (16 bytes)
+    ntb.extend_from_slice(b"NCM0");                          // dwSignature
+    ntb.extend_from_slice(&ndp_len.to_le_bytes());           // wLength
+    ntb.extend_from_slice(&0u16.to_le_bytes());              // wNextNdpIndex
+    ntb.extend_from_slice(&datagram_offset.to_le_bytes());   // wDatagramIndex[0]
+    ntb.extend_from_slice(&(frame.len() as u16).to_le_bytes()); // wDatagramLength[0]
+    ntb.extend_from_slice(&0u16.to_le_bytes());              // terminator index
+    ntb.extend_from_slice(&0u16.to_le_bytes());              // terminator length
+
+    // Datagram (raw Ethernet frame)
+    ntb.extend_from_slice(frame);
+
+    ntb
+}
+
+/// Extract Ethernet frames from an NCM NTB16.
+fn ncm_unwrap_frames(ntb: &[u8]) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+
+    if ntb.len() < 12 {
+        return frames;
+    }
+
+    // Validate NTH16 signature.
+    if &ntb[0..4] != b"NCMH" {
+        return frames;
+    }
+
+    let ndp_index = u16::from_le_bytes([ntb[10], ntb[11]]) as usize;
+    if ndp_index + 12 > ntb.len() {
+        return frames;
+    }
+
+    // Validate NDP16 signature.
+    if &ntb[ndp_index..ndp_index + 4] != b"NCM0" && &ntb[ndp_index..ndp_index + 4] != b"NCM1" {
+        return frames;
+    }
+
+    let ndp_length = u16::from_le_bytes([ntb[ndp_index + 4], ntb[ndp_index + 5]]) as usize;
+
+    // Parse datagram pointer entries (start at ndp_index + 8).
+    let mut offset = ndp_index + 8;
+    while offset + 4 <= ndp_index + ndp_length && offset + 4 <= ntb.len() {
+        let dg_index = u16::from_le_bytes([ntb[offset], ntb[offset + 1]]) as usize;
+        let dg_length = u16::from_le_bytes([ntb[offset + 2], ntb[offset + 3]]) as usize;
+
+        if dg_index == 0 && dg_length == 0 {
+            break; // Terminator
+        }
+
+        if dg_index + dg_length <= ntb.len() && dg_length > 0 {
+            frames.push(ntb[dg_index..dg_index + dg_length].to_vec());
+        }
+
+        offset += 4;
+    }
+
+    frames
 }
 
 // ---------------------------------------------------------------------------
@@ -302,35 +424,49 @@ fn usb_reader_thread(
     mut reader: nusb::io::EndpointRead<nusb::transfer::Bulk>,
     frame_tx: std_mpsc::Sender<Vec<u8>>,
     counters: Arc<FrameCounters>,
+    mode: FramingMode,
 ) {
-    tracing::debug!("USB reader thread started");
-    let mut buf = vec![0u8; MAX_FRAME_SIZE];
+    tracing::debug!(mode = ?mode, "USB reader thread started");
+    let mut buf = vec![0u8; MAX_NTB_SIZE];
     loop {
         match reader.read(&mut buf) {
             Ok(n) if n > 0 => {
-                let count = counters.rx.fetch_add(1, Ordering::Relaxed) + 1;
-                if count <= 5 || count % 100 == 0 {
-                    // Log first few frames and then periodically.
-                    let hex_preview: String = buf[..n.min(32)]
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    tracing::info!(
-                        rx_count = count,
-                        len = n,
-                        preview = hex_preview,
-                        "USB RX frame"
-                    );
-                }
-                if frame_tx.send(buf[..n].to_vec()).is_err() {
-                    tracing::debug!("Frame receiver dropped, reader exiting");
-                    return;
+                let raw = &buf[..n];
+
+                let frames = match mode {
+                    FramingMode::Ncm => ncm_unwrap_frames(raw),
+                    FramingMode::Ecm => vec![raw.to_vec()],
+                };
+
+                for frame in frames {
+                    let count = counters.rx.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count <= 5 || count % 500 == 0 {
+                        let preview: String = frame[..frame.len().min(32)]
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let ethertype = if frame.len() >= 14 {
+                            format!("{:02x}{:02x}", frame[12], frame[13])
+                        } else {
+                            "??".into()
+                        };
+                        tracing::info!(
+                            rx = count,
+                            len = frame.len(),
+                            ethertype,
+                            preview,
+                            "RX"
+                        );
+                    }
+                    if frame_tx.send(frame).is_err() {
+                        return;
+                    }
                 }
             }
             Ok(_) => continue,
             Err(e) => {
-                tracing::error!(?e, "USB bulk IN read error");
+                tracing::error!(?e, "USB bulk IN error");
                 return;
             }
         }
@@ -341,29 +477,35 @@ fn usb_writer_thread(
     mut writer: nusb::io::EndpointWrite<nusb::transfer::Bulk>,
     write_rx: std_mpsc::Receiver<Vec<u8>>,
     counters: Arc<FrameCounters>,
+    mode: FramingMode,
 ) {
-    tracing::debug!("USB writer thread started");
+    tracing::debug!(mode = ?mode, "USB writer thread started");
+    let mut sequence: u16 = 0;
     while let Ok(frame) = write_rx.recv() {
         let count = counters.tx.fetch_add(1, Ordering::Relaxed) + 1;
-        if count <= 5 || count % 100 == 0 {
-            let hex_preview: String = frame[..frame.len().min(32)]
+        if count <= 5 || count % 500 == 0 {
+            let preview: String = frame[..frame.len().min(32)]
                 .iter()
                 .map(|b| format!("{:02x}", b))
                 .collect::<Vec<_>>()
                 .join(" ");
-            tracing::info!(
-                tx_count = count,
-                len = frame.len(),
-                preview = hex_preview,
-                "USB TX frame"
-            );
+            tracing::info!(tx = count, len = frame.len(), preview, "TX");
         }
-        if let Err(e) = writer.write_all(&frame) {
-            tracing::error!(?e, "USB bulk OUT write error");
+
+        let data = match mode {
+            FramingMode::Ncm => {
+                let ntb = ncm_wrap_frame(&frame, sequence);
+                sequence = sequence.wrapping_add(1);
+                ntb
+            }
+            FramingMode::Ecm => frame,
+        };
+
+        if let Err(e) = writer.write_all(&data) {
+            tracing::error!(?e, "USB bulk OUT error");
             return;
         }
     }
-    tracing::debug!("Frame sender dropped, writer exiting");
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +556,7 @@ fn ecm_tcp_thread(
             .map_err(|e| anyhow!("TCP connect failed: {e}"))?;
     }
 
-    tracing::info!("TCP SYN queued to XReal One IMU via USB CDC ECM");
+    tracing::info!("TCP SYN queued via smoltcp");
 
     let start = Instant::now();
     let mut connected = false;
@@ -424,13 +566,12 @@ fn ecm_tcp_thread(
     loop {
         let timestamp = smol_now();
         device.drain_rx();
-
-        let _changed = iface.poll(timestamp, &mut device, &mut sockets);
+        iface.poll(timestamp, &mut device, &mut sockets);
 
         let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
 
         if !connected && socket.may_recv() {
-            tracing::info!("TCP connected to XReal One IMU via USB");
+            tracing::info!("TCP connected to XReal One IMU!");
             connected = true;
         }
 
@@ -438,7 +579,6 @@ fn ecm_tcp_thread(
             match socket.recv_slice(&mut recv_buf) {
                 Ok(n) if n > 0 => {
                     if imu_tx.send(recv_buf[..n].to_vec()).is_err() {
-                        tracing::info!("IMU receiver dropped, ECM thread exiting");
                         return Ok(());
                     }
                 }
@@ -448,23 +588,20 @@ fn ecm_tcp_thread(
         }
 
         if connected && !socket.is_active() {
-            tracing::warn!("TCP connection to XReal One IMU closed");
+            tracing::warn!("TCP connection closed");
             return Ok(());
         }
 
-        // Periodic status while connecting.
         if !connected && last_status.elapsed() > Duration::from_secs(1) {
             last_status = Instant::now();
             let rx = counters.rx.load(Ordering::Relaxed);
             let tx = counters.tx.load(Ordering::Relaxed);
-            let tcp_state = socket.state();
             tracing::info!(
-                elapsed_s = start.elapsed().as_secs(),
-                usb_rx_frames = rx,
-                usb_tx_frames = tx,
-                queued_rx = device.rx_queue.len(),
-                tcp_state = ?tcp_state,
-                "Waiting for TCP connection..."
+                elapsed = start.elapsed().as_secs(),
+                rx_frames = rx,
+                tx_frames = tx,
+                tcp = ?socket.state(),
+                "Waiting for TCP..."
             );
         }
 
@@ -472,10 +609,7 @@ fn ecm_tcp_thread(
             let rx = counters.rx.load(Ordering::Relaxed);
             let tx = counters.tx.load(Ordering::Relaxed);
             return Err(anyhow!(
-                "TCP connection timed out ({TCP_CONNECT_TIMEOUT:?}). \
-                 USB frames: {tx} sent, {rx} received. \
-                 If 0 received, the device may not be responding — \
-                 check Zadig WinUSB is installed for BOTH MI_03 and MI_04."
+                "TCP timed out ({TCP_CONNECT_TIMEOUT:?}). USB: {tx} TX, {rx} RX."
             ));
         }
 
@@ -505,20 +639,16 @@ impl Device for EcmDevice {
     type RxToken<'a> = EcmRxToken;
     type TxToken<'a> = EcmTxToken;
 
-    fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(&mut self, _ts: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let frame = self.rx_queue.pop_front()?;
         Some((
             EcmRxToken { frame },
-            EcmTxToken {
-                tx: self.frame_tx.clone(),
-            },
+            EcmTxToken { tx: self.frame_tx.clone() },
         ))
     }
 
-    fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(EcmTxToken {
-            tx: self.frame_tx.clone(),
-        })
+    fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
+        Some(EcmTxToken { tx: self.frame_tx.clone() })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -534,10 +664,7 @@ struct EcmRxToken {
 }
 
 impl RxToken for EcmRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(mut self, f: F) -> R {
         f(&mut self.frame)
     }
 }
@@ -547,10 +674,7 @@ struct EcmTxToken {
 }
 
 impl TxToken for EcmTxToken {
-    fn consume<R, F>(self, len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
         let _ = self.tx.send(buffer);
