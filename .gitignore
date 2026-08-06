@@ -33,3 +33,6 @@ CLAUDE.md
 /android/local.properties
 /android/build/
 /android/app/build/
+
+## Local diagnostics
+/diagnostics/

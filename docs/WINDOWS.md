@@ -32,3 +32,11 @@ prototype, not a complete virtual monitor replacement.
 powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
 powershell -ExecutionPolicy Bypass -File scripts/run-windows.ps1
 ```
+
+For plugged-in glasses diagnostics, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/test-xreal-windows.ps1 -LaunchSeconds 20
+```
+
+See [Hardware Test Plan](HARDWARE_TEST_PLAN.md) for the full device checklist.

@@ -19,3 +19,12 @@ $env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\Sdk"
 ```
 
 The debug APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
+
+## Device Diagnostics
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/test-android-device.ps1
+powershell -ExecutionPolicy Bypass -File scripts/test-android-device.ps1 -Install
+```
+
+See `docs/HARDWARE_TEST_PLAN.md` for the full Fold7/DeX checklist.

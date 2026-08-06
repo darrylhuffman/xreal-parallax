@@ -75,7 +75,7 @@ parallax/
 └── src/main.rs            # Orchestrates all subsystems
 ```
 
-Each crate is platform-abstracted behind traits (`ScreenCapture`, `VirtualDisplayProvider`) so the renderer, IMU client, config, and input systems can be reused when Android and macOS support are added. See [Windows Status](docs/WINDOWS.md) and [Android Backend Notes](docs/ANDROID.md) for platform status and next steps.
+Each crate is platform-abstracted behind traits (`ScreenCapture`, `VirtualDisplayProvider`) so the renderer, IMU client, config, and input systems can be reused when Android and macOS support are added. See [Windows Status](docs/WINDOWS.md), [Android Backend Notes](docs/ANDROID.md), and [Hardware Test Plan](docs/HARDWARE_TEST_PLAN.md) for platform status and device validation steps.
 
 ## Configuration
 
