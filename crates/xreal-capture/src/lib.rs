@@ -1,5 +1,7 @@
 use anyhow::Result;
 
+pub mod mock;
+
 /// A captured frame from a display.
 pub struct CapturedFrame {
     /// RGBA8 pixel data.
@@ -24,3 +26,14 @@ pub trait ScreenCapture: Send {
 
 #[cfg(windows)]
 pub mod duplication;
+
+#[cfg(windows)]
+type NativeCapture = duplication::DxgiCapture;
+
+#[cfg(not(windows))]
+type NativeCapture = mock::PatternCapture;
+
+/// Create the best available capture backend for this platform.
+pub fn create_capture(monitor_id: u32, width: u32, height: u32) -> Result<Box<dyn ScreenCapture>> {
+    Ok(Box::new(NativeCapture::new(monitor_id, width, height)?))
+}

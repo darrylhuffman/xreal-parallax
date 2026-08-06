@@ -1,6 +1,8 @@
 pub mod fusion;
 pub mod protocol;
 pub mod types;
+
+#[cfg(windows)]
 pub mod usb_ecm;
 
 use anyhow::Result;
@@ -35,36 +37,42 @@ pub struct ImuClient {
 impl ImuClient {
     /// Connect to the XReal One IMU and start processing.
     ///
-    /// Tries USB CDC ECM first (works without a Windows network driver),
-    /// then falls back to direct TCP (requires working CDC ECM OS driver).
+    /// On Windows, tries USB CDC ECM first, then falls back to direct TCP.
+    /// On other platforms, tries direct TCP only.
     pub async fn connect(madgwick_beta: f32, calibration_samples: u32) -> Result<Self> {
-        // Try USB transport first (works on Windows without CDC ECM driver).
-        tracing::info!("Attempting USB CDC ECM connection to XReal One IMU...");
-        match tokio::task::spawn_blocking(usb_ecm::connect_usb).await? {
-            Ok(usb_rx) => {
-                tracing::info!("Connected to XReal One IMU via USB CDC ECM");
-                let (orientation_tx, orientation_rx) = watch::channel(Orientation::default());
-                let (command_tx, command_rx) = mpsc::unbounded_channel();
+        #[cfg(windows)]
+        {
+            // Try USB transport first (works on Windows without CDC ECM driver).
+            tracing::info!("Attempting USB CDC ECM connection to XReal One IMU...");
+            match tokio::task::spawn_blocking(usb_ecm::connect_usb).await? {
+                Ok(usb_rx) => {
+                    tracing::info!("Connected to XReal One IMU via USB CDC ECM");
+                    let (orientation_tx, orientation_rx) = watch::channel(Orientation::default());
+                    let (command_tx, command_rx) = mpsc::unbounded_channel();
 
-                let task = tokio::spawn(imu_read_loop_channel(
-                    usb_rx,
-                    orientation_tx,
-                    command_rx,
-                    madgwick_beta,
-                    calibration_samples,
-                ));
+                    let task = tokio::spawn(imu_read_loop_channel(
+                        usb_rx,
+                        orientation_tx,
+                        command_rx,
+                        madgwick_beta,
+                        calibration_samples,
+                    ));
 
-                return Ok(Self {
-                    orientation_rx,
-                    command_tx,
-                    _task: task,
-                });
-            }
-            Err(e) => {
-                tracing::warn!("USB CDC ECM unavailable: {e:#}");
-                tracing::info!("Falling back to direct TCP...");
+                    return Ok(Self {
+                        orientation_rx,
+                        command_tx,
+                        _task: task,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("USB CDC ECM unavailable: {e:#}");
+                    tracing::info!("Falling back to direct TCP...");
+                }
             }
         }
+
+        #[cfg(not(windows))]
+        tracing::info!("USB CDC ECM transport is Windows-only; trying direct TCP IMU connection");
 
         // Fall back to direct TCP (requires working OS network driver).
         let addr = format!("{}:{}", XREAL_ONE_ADDR.0, XREAL_ONE_ADDR.1);
@@ -129,6 +137,7 @@ impl ImuClient {
 }
 
 /// Process IMU data arriving via a channel (USB CDC ECM path).
+#[cfg(windows)]
 async fn imu_read_loop_channel(
     mut data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     orientation_tx: watch::Sender<Orientation>,

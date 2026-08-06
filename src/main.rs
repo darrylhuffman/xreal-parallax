@@ -39,7 +39,7 @@ struct GpuState {
     scene: Scene,
     panel_resources: Vec<PanelGpuResources>,
     camera: Camera,
-    captures: Vec<xreal_capture::duplication::DxgiCapture>,
+    captures: Vec<Box<dyn ScreenCapture>>,
     /// Depth texture for mono rendering (matches window size, not eye size).
     mono_depth: wgpu::TextureView,
     frame_count: u64,
@@ -65,22 +65,26 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Try to find the XReal One display (3840x1080 or 1920x1080 at high refresh).
+        // Try to find the XReal display.
+        // SBS stereo output currently expects 3840x1080; 1200p modes need renderer support.
         let xreal_monitor = event_loop.available_monitors().find(|m| {
             let size = m.size();
             let name = m.name().unwrap_or_default();
-            let is_xreal = size.width == 3840 && size.height == 1080;
-            let looks_like_xreal =
-                name.to_lowercase().contains("xreal") || (size.width == 1920 && size.height == 1080);
-            if is_xreal {
+            let name_matches = name.to_lowercase().contains("xreal");
+            let is_sbs_output = size.width == 3840 && size.height == 1080;
+            let is_named_mono_output =
+                name_matches && size.width == 1920 && size.height == 1080;
+            let looks_like_xreal = is_sbs_output || is_named_mono_output;
+            if looks_like_xreal {
                 info!(
                     name = name,
                     width = size.width,
                     height = size.height,
-                    "Found XReal display (SBS mode)"
+                    stereo = is_sbs_output,
+                    "Found XReal display"
                 );
             }
-            is_xreal
+            looks_like_xreal
         });
 
         let (attrs, detected_stereo) = if let Some(ref monitor) = xreal_monitor {
@@ -114,7 +118,7 @@ impl ApplicationHandler for App {
 
         // Initialize wgpu.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12 | wgpu::Backends::VULKAN,
+            backends: preferred_backends(),
             ..Default::default()
         });
 
@@ -196,14 +200,14 @@ impl ApplicationHandler for App {
             })
             .collect();
 
-        // Create stub captures for each panel.
+        // Create capture backends for each panel.
         let captures: Vec<_> = self
             .config
             .layout
             .panels
             .iter()
             .map(|p| {
-                xreal_capture::duplication::DxgiCapture::new(
+                xreal_capture::create_capture(
                     p.id,
                     p.resolution.0,
                     p.resolution.1,
@@ -545,6 +549,18 @@ fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu:
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn preferred_backends() -> wgpu::Backends {
+    #[cfg(windows)]
+    {
+        wgpu::Backends::DX12 | wgpu::Backends::VULKAN
+    }
+
+    #[cfg(not(windows))]
+    {
+        wgpu::Backends::PRIMARY
+    }
 }
 
 #[tokio::main]

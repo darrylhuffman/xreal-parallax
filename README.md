@@ -1,6 +1,6 @@
 # XReal Parallax
 
-A spatial multi-monitor workspace for XReal One AR glasses. Turn your single USB-C display into up to 4 virtual monitors floating in 3D space around you — with stereoscopic depth, curved displays, and head tracking.
+A spatial multi-monitor workspace for XReal One-family AR glasses. Turn your single USB-C display into up to 4 virtual monitors floating in 3D space around you — with stereoscopic depth, curved displays, and head tracking.
 
 ## How It Works
 
@@ -42,8 +42,8 @@ Virtual Monitors → Screen Capture → 3D Composition → Head Tracking → Ste
 
 ## Requirements
 
-- **XReal One** or **XReal One Pro** glasses (X1 chip, USB-C)
-- **Windows 10/11** (macOS support planned)
+- **XREAL 1S**, **XReal One**, or **XReal One Pro** glasses (X1 chip family, USB-C)
+- **Windows 10/11** for the current desktop app (Android and macOS backends planned)
 - **Rust 1.75+**
 - **[Virtual Display Driver](https://github.com/MolotovCherry/virtual-display-rs)** (for creating virtual monitors)
 
@@ -59,7 +59,7 @@ cargo build --release
 cargo run --release
 ```
 
-Connect your XReal One glasses via USB-C. Parallax auto-detects the IMU at `169.254.2.1:52998` and falls back to a static camera if the glasses aren't connected.
+Connect your XReal One-family glasses via USB-C. Parallax auto-detects the IMU at `169.254.2.1:52998` and falls back to a static camera if the glasses aren't connected.
 
 ## Architecture
 
@@ -75,7 +75,7 @@ parallax/
 └── src/main.rs            # Orchestrates all subsystems
 ```
 
-Each crate is platform-abstracted behind traits (`ScreenCapture`, `VirtualDisplayProvider`) so the renderer, IMU client, config, and input systems can be reused when macOS support is added.
+Each crate is platform-abstracted behind traits (`ScreenCapture`, `VirtualDisplayProvider`) so the renderer, IMU client, config, and input systems can be reused when Android and macOS support are added. See [Android Backend Notes](docs/ANDROID.md) for the proposed Android path.
 
 ## Configuration
 
@@ -114,6 +114,7 @@ curve_segments = 32
 - [ ] DXGI Desktop Duplication capture (currently stubbed with test patterns)
 - [ ] Virtual display driver integration (virtual-display-rs IPC)
 - [ ] egui settings overlay
+- [ ] Android support (external display surface + MediaProjection/XREAL SDK backends)
 - [ ] macOS support (ScreenCaptureKit + CGVirtualDisplay)
 - [ ] GPU-native texture sharing (zero-copy D3D11→wgpu path)
 
