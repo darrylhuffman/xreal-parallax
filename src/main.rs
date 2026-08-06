@@ -7,11 +7,12 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::monitor::MonitorHandle;
 use winit::window::{Window, WindowId};
 use xreal_capture::ScreenCapture;
 use xreal_config::AppConfig;
 use xreal_imu::ImuClient;
-use xreal_input::mouse::InteractionManager;
+use xreal_input::mouse::{raycast_panels, InteractionManager};
 use xreal_input::PanelAction;
 use xreal_renderer::camera::Camera;
 use xreal_renderer::scene::Scene;
@@ -65,38 +66,18 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Try to find the XReal display.
-        // SBS stereo output currently expects 3840x1080; 1200p modes need renderer support.
-        let xreal_monitor = event_loop.available_monitors().find(|m| {
-            let size = m.size();
-            let name = m.name().unwrap_or_default();
-            let name_matches = name.to_lowercase().contains("xreal");
-            let is_sbs_output = size.width == 3840 && size.height == 1080;
-            let is_named_mono_output =
-                name_matches && size.width == 1920 && size.height == 1080;
-            let looks_like_xreal = is_sbs_output || is_named_mono_output;
-            if looks_like_xreal {
-                info!(
-                    name = name,
-                    width = size.width,
-                    height = size.height,
-                    stereo = is_sbs_output,
-                    "Found XReal display"
-                );
-            }
-            looks_like_xreal
-        });
+        let xreal_monitor = find_xreal_monitor(event_loop, self.config.target_display.as_deref());
 
-        let (attrs, detected_stereo) = if let Some(ref monitor) = xreal_monitor {
+        let (attrs, detected_stereo) = if let Some((ref monitor, is_sbs_output)) = xreal_monitor {
             // Fullscreen borderless on the XReal display.
-            info!("Going fullscreen on XReal display");
+            info!(stereo = is_sbs_output, "Going fullscreen on XReal display");
             (
                 Window::default_attributes()
                     .with_title("XReal Parallax")
                     .with_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(
                         monitor.clone(),
                     )))),
-                true,
+                is_sbs_output,
             )
         } else {
             // Windowed mode for development.
@@ -113,7 +94,11 @@ impl ApplicationHandler for App {
             self.stereo_mode = true;
         }
 
-        let window = Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
+        let window = Arc::new(
+            event_loop
+                .create_window(attrs)
+                .expect("Failed to create window"),
+        );
         self.window = Some(window.clone());
 
         // Initialize wgpu.
@@ -177,8 +162,14 @@ impl ApplicationHandler for App {
         };
         surface.configure(&device, &surface_config);
 
-        // Create stereo renderer.
-        let stereo = StereoRenderer::new(&device, format, self.config.ipd_mm);
+        // Create stereo renderer sized for the current output surface.
+        let stereo = StereoRenderer::new(
+            &device,
+            format,
+            self.config.ipd_mm,
+            win_size.width,
+            win_size.height,
+        );
 
         // Create scene from config.
         let scene = Scene::from_configs(&self.config.layout.panels);
@@ -207,12 +198,8 @@ impl ApplicationHandler for App {
             .panels
             .iter()
             .map(|p| {
-                xreal_capture::create_capture(
-                    p.id,
-                    p.resolution.0,
-                    p.resolution.1,
-                )
-                .expect("Failed to create capture")
+                xreal_capture::create_capture(p.id, p.resolution.0, p.resolution.1)
+                    .expect("Failed to create capture")
             })
             .collect();
 
@@ -264,8 +251,13 @@ impl ApplicationHandler for App {
                         gpu.surface_config.width = size.width;
                         gpu.surface_config.height = size.height;
                         gpu.surface.configure(&gpu.device, &gpu.surface_config);
-                        gpu.mono_depth =
-                            create_depth_texture(&gpu.device, size.width, size.height);
+                        gpu.stereo.resize_output(
+                            &gpu.device,
+                            gpu.surface_config.format,
+                            size.width,
+                            size.height,
+                        );
+                        gpu.mono_depth = create_depth_texture(&gpu.device, size.width, size.height);
                         self.interaction
                             .set_window_size(size.width as f32, size.height as f32);
                     }
@@ -302,6 +294,9 @@ impl ApplicationHandler for App {
                 if let Some(action) = self.interaction.on_cursor_moved(position.x, position.y) {
                     apply_panel_action(&mut self.gpu, action);
                 }
+                if !self.interaction.is_dragging() {
+                    update_hovered_panel(&mut self.gpu, &mut self.interaction);
+                }
             }
 
             WindowEvent::MouseInput { button, state, .. } => {
@@ -335,7 +330,9 @@ impl ApplicationHandler for App {
                     let orientation = self.imu_client.orientation();
                     gpu.camera.orientation = orientation.quaternion;
 
-                    // Capture frames (stub: generates test patterns).
+                    rebuild_dirty_panel_meshes(gpu);
+
+                    // Capture frames.
                     for (capture, resources) in
                         gpu.captures.iter_mut().zip(gpu.panel_resources.iter())
                     {
@@ -360,6 +357,8 @@ impl ApplicationHandler for App {
                     };
 
                     if self.stereo_mode {
+                        gpu.camera.aspect_ratio = gpu.stereo.eye_aspect_ratio();
+
                         // SBS stereo rendering.
                         let cmd = gpu.stereo.render_frame(
                             &gpu.device,
@@ -370,11 +369,11 @@ impl ApplicationHandler for App {
                         );
                         gpu.queue.submit(std::iter::once(cmd));
 
-                        let mut encoder = gpu.device.create_command_encoder(
-                            &wgpu::CommandEncoderDescriptor {
-                                label: Some("sbs_compose"),
-                            },
-                        );
+                        let mut encoder =
+                            gpu.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("sbs_compose"),
+                                });
                         gpu.stereo.compose_sbs(&mut encoder, &output.texture);
                         gpu.queue.submit(std::iter::once(encoder.finish()));
                     } else {
@@ -384,59 +383,51 @@ impl ApplicationHandler for App {
                             .create_view(&wgpu::TextureViewDescriptor::default());
 
                         // Use actual window aspect ratio for mono mode.
-                        gpu.camera.aspect_ratio = gpu.surface_config.width as f32
-                            / gpu.surface_config.height as f32;
+                        gpu.camera.aspect_ratio =
+                            gpu.surface_config.width as f32 / gpu.surface_config.height as f32;
                         let projection = gpu.camera.projection_matrix();
                         let view_matrix = gpu.camera.view_matrix();
 
-                        let mut encoder = gpu.device.create_command_encoder(
-                            &wgpu::CommandEncoderDescriptor {
-                                label: Some("mono_render"),
-                            },
-                        );
-
-                        {
-                            let mut pass =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("mono_pass"),
-                                    color_attachments: &[Some(
-                                        wgpu::RenderPassColorAttachment {
-                                            view: &view,
-                                            resolve_target: None,
-                                            ops: wgpu::Operations {
-                                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                                    r: 0.02,
-                                                    g: 0.02,
-                                                    b: 0.05,
-                                                    a: 1.0,
-                                                }),
-                                                store: wgpu::StoreOp::Store,
-                                            },
-                                        },
-                                    )],
-                                    depth_stencil_attachment: Some(
-                                        wgpu::RenderPassDepthStencilAttachment {
-                                            view: &gpu.mono_depth,
-                                            depth_ops: Some(wgpu::Operations {
-                                                load: wgpu::LoadOp::Clear(1.0),
-                                                store: wgpu::StoreOp::Store,
-                                            }),
-                                            stencil_ops: None,
-                                        },
-                                    ),
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
+                        let mut encoder =
+                            gpu.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("mono_render"),
                                 });
 
-                            pass.set_pipeline(
-                                &gpu.stereo.render_pipeline.pipeline,
-                            );
+                        {
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("mono_pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                                            r: 0.02,
+                                            g: 0.02,
+                                            b: 0.05,
+                                            a: 1.0,
+                                        }),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: Some(
+                                    wgpu::RenderPassDepthStencilAttachment {
+                                        view: &gpu.mono_depth,
+                                        depth_ops: Some(wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(1.0),
+                                            store: wgpu::StoreOp::Store,
+                                        }),
+                                        stencil_ops: None,
+                                    },
+                                ),
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
 
-                            for (panel, resources) in gpu
-                                .scene
-                                .panels
-                                .iter()
-                                .zip(gpu.panel_resources.iter())
+                            pass.set_pipeline(&gpu.stereo.render_pipeline.pipeline);
+
+                            for (panel, resources) in
+                                gpu.scene.panels.iter().zip(gpu.panel_resources.iter())
                             {
                                 let model = panel.model_matrix();
                                 let uniforms = xreal_renderer::pipeline::Uniforms::new(
@@ -456,30 +447,16 @@ impl ApplicationHandler for App {
                                 let uniform_bind_group = gpu
                                     .stereo
                                     .render_pipeline
-                                    .create_uniform_bind_group(
-                                        &gpu.device,
-                                        &uniform_buffer,
-                                    );
+                                    .create_uniform_bind_group(&gpu.device, &uniform_buffer);
 
                                 pass.set_bind_group(0, &uniform_bind_group, &[]);
-                                pass.set_bind_group(
-                                    1,
-                                    &resources.texture_bind_group,
-                                    &[],
-                                );
-                                pass.set_vertex_buffer(
-                                    0,
-                                    resources.vertex_buffer.slice(..),
-                                );
+                                pass.set_bind_group(1, &resources.texture_bind_group, &[]);
+                                pass.set_vertex_buffer(0, resources.vertex_buffer.slice(..));
                                 pass.set_index_buffer(
                                     resources.index_buffer.slice(..),
                                     wgpu::IndexFormat::Uint32,
                                 );
-                                pass.draw_indexed(
-                                    0..resources.index_count,
-                                    0,
-                                    0..1,
-                                );
+                                pass.draw_indexed(0..resources.index_count, 0, 0..1);
                             }
                         }
 
@@ -515,8 +492,9 @@ fn apply_panel_action(gpu: &mut Option<GpuState>, (panel_id, action): (u32, Pane
         match action {
             PanelAction::Move(pos) => panel.position = pos,
             PanelAction::Depth(delta) => {
-                let forward = panel.position.normalize();
-                panel.position += forward * delta;
+                if let Some(forward) = panel.position.try_normalize() {
+                    panel.position += forward * delta;
+                }
             }
             PanelAction::Resize(scale) => {
                 panel.scale = scale;
@@ -529,6 +507,91 @@ fn apply_panel_action(gpu: &mut Option<GpuState>, (panel_id, action): (u32, Pane
             PanelAction::Rotate(q) => {
                 panel.rotation = q;
             }
+            PanelAction::RotateBy(q) => {
+                panel.rotation = q * panel.rotation;
+            }
+        }
+    }
+}
+
+fn find_xreal_monitor(
+    event_loop: &ActiveEventLoop,
+    target_display: Option<&str>,
+) -> Option<(MonitorHandle, bool)> {
+    let target = target_display.map(|s| s.to_lowercase());
+
+    for (index, monitor) in event_loop.available_monitors().enumerate() {
+        let size = monitor.size();
+        let name = monitor.name().unwrap_or_default();
+        let name_lower = name.to_lowercase();
+
+        let target_matches = target.as_ref().map_or(false, |target| {
+            name_lower.contains(target) || index.to_string() == *target
+        });
+        let name_matches = name_lower.contains("xreal") || name_lower.contains("nreal");
+        let is_sbs_output = is_supported_sbs_size(size.width, size.height);
+        let is_named_mono_output = name_matches && is_supported_mono_size(size.width, size.height);
+
+        if target_matches || name_matches || is_sbs_output || is_named_mono_output {
+            info!(
+                index,
+                name,
+                width = size.width,
+                height = size.height,
+                stereo = is_sbs_output,
+                "Found candidate XReal display"
+            );
+            return Some((monitor, is_sbs_output));
+        }
+    }
+
+    None
+}
+
+fn is_supported_sbs_size(width: u32, height: u32) -> bool {
+    width == 3840 && matches!(height, 1080 | 1200)
+}
+
+fn is_supported_mono_size(width: u32, height: u32) -> bool {
+    matches!((width, height), (1920, 1080) | (1920, 1200))
+}
+
+fn update_hovered_panel(gpu: &mut Option<GpuState>, interaction: &mut InteractionManager) {
+    let Some(gpu) = gpu.as_mut() else {
+        return;
+    };
+
+    gpu.camera.aspect_ratio = gpu.surface_config.width as f32 / gpu.surface_config.height as f32;
+    let projection = gpu.camera.projection_matrix();
+    let view = gpu.camera.view_matrix();
+    let inv_view_proj = (projection * view).inverse();
+    let panels: Vec<_> = gpu
+        .scene
+        .panels
+        .iter()
+        .map(|panel| (panel.id, panel.model_matrix(), panel.scale))
+        .collect();
+
+    interaction.hovered_panel =
+        raycast_panels(interaction.cursor_ndc(), inv_view_proj, &panels).map(|hit| hit.0);
+}
+
+fn rebuild_dirty_panel_meshes(gpu: &mut GpuState) {
+    for (panel, resources) in gpu
+        .scene
+        .panels
+        .iter_mut()
+        .zip(gpu.panel_resources.iter_mut())
+    {
+        if panel.mesh_dirty {
+            gpu.stereo.rebuild_panel_mesh(
+                &gpu.device,
+                resources,
+                panel.scale,
+                panel.curvature,
+                panel.curve_segments,
+            );
+            panel.mesh_dirty = false;
         }
     }
 }
@@ -584,21 +647,17 @@ async fn main() -> Result<()> {
     info!(?config.layout.preset, panels = config.layout.panels.len(), "Config loaded");
 
     // Connect to IMU (fall back to mock if glasses not connected).
-    let imu_client = match ImuClient::connect(
-        config.imu.madgwick_beta,
-        config.imu.calibration_samples,
-    )
-    .await
-    {
-        Ok(client) => {
-            info!("IMU connected");
-            client
-        }
-        Err(e) => {
-            warn!(?e, "IMU not available, using mock (no head tracking)");
-            ImuClient::mock()
-        }
-    };
+    let imu_client =
+        match ImuClient::connect(config.imu.madgwick_beta, config.imu.calibration_samples).await {
+            Ok(client) => {
+                info!("IMU connected");
+                client
+            }
+            Err(e) => {
+                warn!(?e, "IMU not available, using mock (no head tracking)");
+                ImuClient::mock()
+            }
+        };
 
     // Run the application.
     let event_loop = EventLoop::new()?;

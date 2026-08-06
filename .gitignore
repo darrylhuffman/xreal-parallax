@@ -27,3 +27,9 @@ CLAUDE.md
 ## direnv
 /.envrc
 /.direnv/
+
+## Android
+/android/.gradle/
+/android/local.properties
+/android/build/
+/android/app/build/

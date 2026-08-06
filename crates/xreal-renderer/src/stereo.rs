@@ -5,17 +5,17 @@ use crate::scene::Scene;
 use bytemuck;
 use wgpu::util::DeviceExt;
 
-/// Per-eye render target resolution.
-const EYE_WIDTH: u32 = 1920;
-const EYE_HEIGHT: u32 = 1080;
-
 /// Manages SBS stereoscopic rendering.
 ///
-/// Renders the scene from two eye positions, composites into a
-/// 3840x1080 side-by-side framebuffer.
+/// Renders the scene from two eye positions, then composites them into a
+/// side-by-side framebuffer sized for the current output surface.
 pub struct StereoRenderer {
     /// Interpupillary distance in meters.
     pub ipd: f32,
+    /// Per-eye render target width.
+    eye_width: u32,
+    /// Per-eye render target height.
+    eye_height: u32,
     /// Left eye offscreen render target.
     left_eye: EyeTarget,
     /// Right eye offscreen render target.
@@ -31,12 +31,18 @@ struct EyeTarget {
 }
 
 impl EyeTarget {
-    fn new(device: &wgpu::Device, label: &str, color_format: wgpu::TextureFormat) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        label: &str,
+        color_format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
-                width: EYE_WIDTH,
-                height: EYE_HEIGHT,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -53,8 +59,8 @@ impl EyeTarget {
         let depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&format!("{}_depth", label)),
             size: wgpu::Extent3d {
-                width: EYE_WIDTH,
-                height: EYE_HEIGHT,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -86,18 +92,50 @@ pub struct PanelGpuResources {
 }
 
 impl StereoRenderer {
-    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat, ipd_mm: f32) -> Self {
-        let left_eye = EyeTarget::new(device, "left_eye", color_format);
-        let right_eye = EyeTarget::new(device, "right_eye", color_format);
-        let render_pipeline =
-            RenderPipeline::new(device, color_format, EYE_WIDTH, EYE_HEIGHT);
+    pub fn new(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        ipd_mm: f32,
+        output_width: u32,
+        output_height: u32,
+    ) -> Self {
+        let (eye_width, eye_height) = eye_size_from_output(output_width, output_height);
+        let left_eye = EyeTarget::new(device, "left_eye", color_format, eye_width, eye_height);
+        let right_eye = EyeTarget::new(device, "right_eye", color_format, eye_width, eye_height);
+        let render_pipeline = RenderPipeline::new(device, color_format, eye_width, eye_height);
 
         Self {
             ipd: ipd_mm / 1000.0, // Convert mm to meters.
+            eye_width,
+            eye_height,
             left_eye,
             right_eye,
             render_pipeline,
         }
+    }
+
+    /// Resize per-eye targets after the output surface changes.
+    pub fn resize_output(
+        &mut self,
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        output_width: u32,
+        output_height: u32,
+    ) {
+        let (eye_width, eye_height) = eye_size_from_output(output_width, output_height);
+        if self.eye_width == eye_width && self.eye_height == eye_height {
+            return;
+        }
+
+        self.eye_width = eye_width;
+        self.eye_height = eye_height;
+        self.left_eye = EyeTarget::new(device, "left_eye", color_format, eye_width, eye_height);
+        self.right_eye = EyeTarget::new(device, "right_eye", color_format, eye_width, eye_height);
+        self.render_pipeline.resize(device, eye_width, eye_height);
+    }
+
+    pub fn eye_aspect_ratio(&self) -> f32 {
+        self.eye_width as f32 / self.eye_height as f32
     }
 
     /// Create GPU resources for a panel (mesh + texture placeholder).
@@ -124,10 +162,11 @@ impl StereoRenderer {
         });
 
         // Create a placeholder texture (checkerboard pattern for dev).
-        let (tex, view) =
-            create_placeholder_texture(device, resolution.0, resolution.1);
+        let (tex, view) = create_placeholder_texture(device, resolution.0, resolution.1);
 
-        let bind_group = self.render_pipeline.create_texture_bind_group(device, &view);
+        let bind_group = self
+            .render_pipeline
+            .create_texture_bind_group(device, &view);
 
         PanelGpuResources {
             vertex_buffer,
@@ -151,19 +190,17 @@ impl StereoRenderer {
     ) {
         let mesh = generate_panel_mesh(scale, curvature, curve_segments);
 
-        resources.vertex_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("panel_vertex_buffer"),
-                contents: bytemuck::cast_slice(&mesh.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+        resources.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("panel_vertex_buffer"),
+            contents: bytemuck::cast_slice(&mesh.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
 
-        resources.index_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("panel_index_buffer"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+        resources.index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("panel_index_buffer"),
+            contents: bytemuck::cast_slice(&mesh.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
 
         resources.index_count = mesh.indices.len() as u32;
     }
@@ -290,12 +327,11 @@ impl StereoRenderer {
             let model = panel.model_matrix();
             let uniforms = Uniforms::new(model, view, projection);
 
-            let uniform_buffer =
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("uniform_buffer"),
-                    contents: bytemuck::cast_slice(&[uniforms]),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+            let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("uniform_buffer"),
+                contents: bytemuck::cast_slice(&[uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
             let uniform_bind_group = self
                 .render_pipeline
@@ -310,11 +346,7 @@ impl StereoRenderer {
     }
 
     /// Copy both eye textures side-by-side onto the output surface.
-    pub fn compose_sbs(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        output: &wgpu::Texture,
-    ) {
+    pub fn compose_sbs(&self, encoder: &mut wgpu::CommandEncoder, output: &wgpu::Texture) {
         // Left eye → left half (0, 0).
         encoder.copy_texture_to_texture(
             wgpu::ImageCopyTexture {
@@ -330,13 +362,13 @@ impl StereoRenderer {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::Extent3d {
-                width: EYE_WIDTH,
-                height: EYE_HEIGHT,
+                width: self.eye_width,
+                height: self.eye_height,
                 depth_or_array_layers: 1,
             },
         );
 
-        // Right eye → right half (1920, 0).
+        // Right eye -> right half.
         encoder.copy_texture_to_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.right_eye.texture,
@@ -347,12 +379,16 @@ impl StereoRenderer {
             wgpu::ImageCopyTexture {
                 texture: output,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: EYE_WIDTH, y: 0, z: 0 },
+                origin: wgpu::Origin3d {
+                    x: self.eye_width,
+                    y: 0,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::Extent3d {
-                width: EYE_WIDTH,
-                height: EYE_HEIGHT,
+                width: self.eye_width,
+                height: self.eye_height,
                 depth_or_array_layers: 1,
             },
         );
@@ -362,6 +398,10 @@ impl StereoRenderer {
     pub fn left_eye_view(&self) -> &wgpu::TextureView {
         &self.left_eye.view
     }
+}
+
+fn eye_size_from_output(output_width: u32, output_height: u32) -> (u32, u32) {
+    ((output_width / 2).max(1), output_height.max(1))
 }
 
 /// Create a checkerboard placeholder texture for development.

@@ -9,7 +9,7 @@ pub struct Camera {
     pub orientation: Quat,
     /// Vertical field of view in degrees (XReal One: ~46°).
     pub fov_y_degrees: f32,
-    /// Aspect ratio (width / height). Per eye: 1920/1080 ≈ 1.778.
+    /// Aspect ratio (width / height).
     pub aspect_ratio: f32,
     /// Near clipping plane (meters).
     pub near: f32,

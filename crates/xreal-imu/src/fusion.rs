@@ -19,10 +19,7 @@ pub struct SensorFusion {
 }
 
 enum CalibrationState {
-    Collecting {
-        samples: Vec<Vec3>,
-        target: usize,
-    },
+    Collecting { samples: Vec<Vec3>, target: usize },
     Calibrated,
 }
 

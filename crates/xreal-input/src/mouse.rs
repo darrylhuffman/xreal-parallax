@@ -47,6 +47,14 @@ impl InteractionManager {
         self.alt_held
     }
 
+    pub fn is_dragging(&self) -> bool {
+        self.dragging.is_some()
+    }
+
+    pub fn cursor_ndc(&self) -> Vec2 {
+        self.cursor_ndc
+    }
+
     pub fn set_window_size(&mut self, width: f32, height: f32) {
         self.window_size = Vec2::new(width, height);
     }
@@ -77,12 +85,12 @@ impl InteractionManager {
                 MouseButton::Left => {
                     // Move in view plane.
                     let scale_factor = drag.panel_depth * 2.0;
-                    let world_delta = Vec3::new(
-                        delta_ndc.x * scale_factor,
-                        delta_ndc.y * scale_factor,
-                        0.0,
-                    );
-                    Some((panel_id, PanelAction::Move(drag.initial_position + world_delta)))
+                    let world_delta =
+                        Vec3::new(delta_ndc.x * scale_factor, delta_ndc.y * scale_factor, 0.0);
+                    Some((
+                        panel_id,
+                        PanelAction::Move(drag.initial_position + world_delta),
+                    ))
                 }
                 MouseButton::Right => {
                     // Resize: horizontal = width, vertical = height.
@@ -99,8 +107,7 @@ impl InteractionManager {
                         Some((panel_id, PanelAction::Curvature(new_curve)))
                     } else {
                         let pitch = delta_ndc.y * std::f32::consts::PI * 0.25;
-                        let new_rotation =
-                            drag.initial_rotation * Quat::from_rotation_x(pitch);
+                        let new_rotation = drag.initial_rotation * Quat::from_rotation_x(pitch);
                         Some((panel_id, PanelAction::Rotate(new_rotation)))
                     }
                 }
@@ -138,11 +145,7 @@ impl InteractionManager {
                 }
             }
             ElementState::Released => {
-                if self
-                    .dragging
-                    .as_ref()
-                    .map_or(false, |d| d.button == button)
-                {
+                if self.dragging.as_ref().map_or(false, |d| d.button == button) {
                     self.dragging = None;
                 }
             }
@@ -164,11 +167,11 @@ impl InteractionManager {
         if self.modifiers.shift_key() {
             // Shift + scroll: yaw rotation.
             let yaw = scroll_y * 0.05;
-            Some((panel_id, PanelAction::Rotate(Quat::from_rotation_y(yaw))))
+            Some((panel_id, PanelAction::RotateBy(Quat::from_rotation_y(yaw))))
         } else if self.modifiers.control_key() {
             // Ctrl + scroll: roll rotation.
             let roll = scroll_y * 0.05;
-            Some((panel_id, PanelAction::Rotate(Quat::from_rotation_z(roll))))
+            Some((panel_id, PanelAction::RotateBy(Quat::from_rotation_z(roll))))
         } else {
             // Plain scroll: depth adjustment.
             Some((panel_id, PanelAction::Depth(scroll_y * 0.1)))
@@ -202,7 +205,9 @@ pub fn raycast_panels(
     for &(id, model, scale) in panels {
         // Panel center and normal in world space.
         let center = model.col(3).truncate();
-        let normal = (model * Vec4::new(0.0, 0.0, 1.0, 0.0)).truncate().normalize();
+        let normal = (model * Vec4::new(0.0, 0.0, 1.0, 0.0))
+            .truncate()
+            .normalize();
 
         // Ray-plane intersection.
         let denom = normal.dot(ray_dir);

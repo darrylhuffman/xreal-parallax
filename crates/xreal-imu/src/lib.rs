@@ -78,13 +78,10 @@ impl ImuClient {
         let addr = format!("{}:{}", XREAL_ONE_ADDR.0, XREAL_ONE_ADDR.1);
         tracing::info!(%addr, "Connecting to XReal One IMU via TCP (3s timeout)");
 
-        let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("IMU connection timed out after 3s"))?
-        ?;
+        let stream =
+            tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(&addr))
+                .await
+                .map_err(|_| anyhow::anyhow!("IMU connection timed out after 3s"))??;
         tracing::info!("Connected to XReal One IMU via TCP");
 
         let (orientation_tx, orientation_rx) = watch::channel(Orientation::default());

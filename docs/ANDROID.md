@@ -17,9 +17,10 @@ common supported source, while Android support is limited to devices with
 desktop modes such as Samsung DeX or Huawei Desktop Mode. A standard mobile
 Android source should not be treated as equivalent to a PC.
 
-The current SBS renderer is fixed at 1920 x 1080 per eye. XREAL 1S 1200p modes
-need a follow-up renderer change so eye target sizes and SBS composition are not
-hard-coded to 1080p.
+The SBS renderer sizes its per-eye targets from the current output surface, so
+1080p and 1200p side-by-side outputs can use the same renderer path. XREAL 1S
+hardware validation still needs to confirm the exact USB display mode and IMU
+transport exposed to each host OS.
 
 ## Backend Shape
 

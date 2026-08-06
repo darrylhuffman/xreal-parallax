@@ -18,12 +18,8 @@ impl PatternCapture {
             width, height, "Pattern capture initialized (no native backend)"
         );
 
-        let colors: [(u8, u8, u8); 4] = [
-            (40, 80, 160),
-            (160, 60, 40),
-            (40, 140, 60),
-            (140, 100, 40),
-        ];
+        let colors: [(u8, u8, u8); 4] =
+            [(40, 80, 160), (160, 60, 40), (40, 140, 60), (140, 100, 40)];
         let (r, g, b) = colors[(monitor_id as usize) % colors.len()];
 
         let pixel_count = (width * height) as usize;

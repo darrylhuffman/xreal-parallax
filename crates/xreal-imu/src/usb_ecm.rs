@@ -118,7 +118,8 @@ pub fn connect_usb() -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
             data = candidate.data_iface,
             bulk_in = format!("0x{:02x}", candidate.bulk_in_ep),
             bulk_out = format!("0x{:02x}", candidate.bulk_out_ep),
-            "Trying {} interface...", mode_name
+            "Trying {} interface...",
+            mode_name
         );
 
         match try_connect(&device, candidate) {
@@ -168,17 +169,20 @@ fn try_connect(
     tracing::info!("  Alt setting 1 activated");
 
     // Enable packet filter.
-    match comm.control_out(
-        nusb::transfer::ControlOut {
-            control_type: nusb::transfer::ControlType::Class,
-            recipient: nusb::transfer::Recipient::Interface,
-            request: SET_ETHERNET_PACKET_FILTER,
-            value: PACKET_TYPE_ALL,
-            index: iface.comm_iface as u16,
-            data: &[],
-        },
-        Duration::from_millis(1000),
-    ).wait() {
+    match comm
+        .control_out(
+            nusb::transfer::ControlOut {
+                control_type: nusb::transfer::ControlType::Class,
+                recipient: nusb::transfer::Recipient::Interface,
+                request: SET_ETHERNET_PACKET_FILTER,
+                value: PACKET_TYPE_ALL,
+                index: iface.comm_iface as u16,
+                data: &[],
+            },
+            Duration::from_millis(1000),
+        )
+        .wait()
+    {
         Ok(()) => tracing::info!("  SET_ETHERNET_PACKET_FILTER succeeded"),
         Err(e) => tracing::warn!("  SET_ETHERNET_PACKET_FILTER: {e}"),
     }
@@ -252,16 +256,23 @@ fn dump_usb_descriptors(config: &nusb::descriptors::ConfigurationDescriptor) {
             (0xFF, _) => "Vendor",
             _ => "Other",
         };
-        let eps: Vec<String> = iface_desc.endpoints().map(|ep| {
-            let dir = if ep.direction() == nusb::transfer::Direction::In { "IN" } else { "OUT" };
-            let tt = match ep.transfer_type() {
-                nusb::descriptors::TransferType::Bulk => "bulk",
-                nusb::descriptors::TransferType::Interrupt => "int",
-                nusb::descriptors::TransferType::Isochronous => "iso",
-                nusb::descriptors::TransferType::Control => "ctrl",
-            };
-            format!("0x{:02x} {} {}", ep.address(), dir, tt)
-        }).collect();
+        let eps: Vec<String> = iface_desc
+            .endpoints()
+            .map(|ep| {
+                let dir = if ep.direction() == nusb::transfer::Direction::In {
+                    "IN"
+                } else {
+                    "OUT"
+                };
+                let tt = match ep.transfer_type() {
+                    nusb::descriptors::TransferType::Bulk => "bulk",
+                    nusb::descriptors::TransferType::Interrupt => "int",
+                    nusb::descriptors::TransferType::Isochronous => "iso",
+                    nusb::descriptors::TransferType::Control => "ctrl",
+                };
+                format!("0x{:02x} {} {}", ep.address(), dir, tt)
+            })
+            .collect();
         tracing::info!(
             "  iface={} alt={} class={:02x}/{:02x} {} eps={:?}",
             iface_desc.interface_number(),
@@ -351,7 +362,7 @@ fn find_all_network_interfaces(
 /// Wrap a single Ethernet frame in an NCM NTB16 for transmission.
 fn ncm_wrap_frame(frame: &[u8], sequence: u16) -> Vec<u8> {
     let ndp_offset: u16 = 12; // NDP immediately after NTH16
-    // NDP16: signature(4) + length(2) + next_ndp(2) + 1 entry(4) + terminator(4) = 16
+                              // NDP16: signature(4) + length(2) + next_ndp(2) + 1 entry(4) + terminator(4) = 16
     let ndp_len: u16 = 16;
     let datagram_offset = ndp_offset + ndp_len;
     let block_length = datagram_offset + frame.len() as u16;
@@ -359,20 +370,20 @@ fn ncm_wrap_frame(frame: &[u8], sequence: u16) -> Vec<u8> {
     let mut ntb = Vec::with_capacity(block_length as usize);
 
     // NTH16 (12 bytes)
-    ntb.extend_from_slice(b"NCMH");                         // dwSignature
-    ntb.extend_from_slice(&12u16.to_le_bytes());             // wHeaderLength
-    ntb.extend_from_slice(&sequence.to_le_bytes());          // wSequence
-    ntb.extend_from_slice(&block_length.to_le_bytes());      // wBlockLength
-    ntb.extend_from_slice(&ndp_offset.to_le_bytes());        // wNdpIndex
+    ntb.extend_from_slice(b"NCMH"); // dwSignature
+    ntb.extend_from_slice(&12u16.to_le_bytes()); // wHeaderLength
+    ntb.extend_from_slice(&sequence.to_le_bytes()); // wSequence
+    ntb.extend_from_slice(&block_length.to_le_bytes()); // wBlockLength
+    ntb.extend_from_slice(&ndp_offset.to_le_bytes()); // wNdpIndex
 
     // NDP16 (16 bytes)
-    ntb.extend_from_slice(b"NCM0");                          // dwSignature
-    ntb.extend_from_slice(&ndp_len.to_le_bytes());           // wLength
-    ntb.extend_from_slice(&0u16.to_le_bytes());              // wNextNdpIndex
-    ntb.extend_from_slice(&datagram_offset.to_le_bytes());   // wDatagramIndex[0]
+    ntb.extend_from_slice(b"NCM0"); // dwSignature
+    ntb.extend_from_slice(&ndp_len.to_le_bytes()); // wLength
+    ntb.extend_from_slice(&0u16.to_le_bytes()); // wNextNdpIndex
+    ntb.extend_from_slice(&datagram_offset.to_le_bytes()); // wDatagramIndex[0]
     ntb.extend_from_slice(&(frame.len() as u16).to_le_bytes()); // wDatagramLength[0]
-    ntb.extend_from_slice(&0u16.to_le_bytes());              // terminator index
-    ntb.extend_from_slice(&0u16.to_le_bytes());              // terminator length
+    ntb.extend_from_slice(&0u16.to_le_bytes()); // terminator index
+    ntb.extend_from_slice(&0u16.to_le_bytes()); // terminator length
 
     // Datagram (raw Ethernet frame)
     ntb.extend_from_slice(frame);
@@ -460,13 +471,7 @@ fn usb_reader_thread(
                         } else {
                             "??".into()
                         };
-                        tracing::info!(
-                            rx = count,
-                            len = frame.len(),
-                            ethertype,
-                            preview,
-                            "RX"
-                        );
+                        tracing::info!(rx = count, len = frame.len(), ethertype, preview, "RX");
                     }
                     if frame_tx.send(frame).is_err() {
                         return;
@@ -654,12 +659,16 @@ impl Device for EcmDevice {
         let frame = self.rx_queue.pop_front()?;
         Some((
             EcmRxToken { frame },
-            EcmTxToken { tx: self.frame_tx.clone() },
+            EcmTxToken {
+                tx: self.frame_tx.clone(),
+            },
         ))
     }
 
     fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(EcmTxToken { tx: self.frame_tx.clone() })
+        Some(EcmTxToken {
+            tx: self.frame_tx.clone(),
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {

@@ -14,4 +14,6 @@ pub enum PanelAction {
     Curvature(f32),
     /// Rotate panel.
     Rotate(Quat),
+    /// Rotate panel relative to its current orientation.
+    RotateBy(Quat),
 }

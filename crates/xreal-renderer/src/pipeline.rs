@@ -32,10 +32,17 @@ pub struct RenderPipeline {
 }
 
 impl RenderPipeline {
-    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat, width: u32, height: u32) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("panel_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../../assets/shaders/panel.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../assets/shaders/panel.wgsl").into(),
+            ),
         });
 
         // Bind group 0: Uniforms (MVP matrices).
