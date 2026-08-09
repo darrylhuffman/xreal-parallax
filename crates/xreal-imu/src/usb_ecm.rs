@@ -29,9 +29,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// XReal One USB identifiers.
+/// XReal One-family USB identifiers.
 const XREAL_VID: u16 = 0x3318;
-const XREAL_PID: u16 = 0x0438;
+const XREAL_PRODUCT_IDS: &[(u16, &str)] = &[(0x0438, "XReal One / One Pro"), (0x043E, "XREAL 1S")];
 
 /// XReal One IMU TCP endpoint.
 const XREAL_IMU_IP: [u8; 4] = [169, 254, 2, 1];
@@ -58,6 +58,27 @@ const MAX_NTB_SIZE: usize = 4096;
 /// TCP connection timeout.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn is_supported_xreal_pid(product_id: u16) -> bool {
+    XREAL_PRODUCT_IDS
+        .iter()
+        .any(|(supported_pid, _)| *supported_pid == product_id)
+}
+
+fn xreal_product_name(product_id: u16) -> &'static str {
+    XREAL_PRODUCT_IDS
+        .iter()
+        .find_map(|(supported_pid, name)| (*supported_pid == product_id).then_some(*name))
+        .unwrap_or("XReal One-family")
+}
+
+fn supported_pid_list() -> String {
+    XREAL_PRODUCT_IDS
+        .iter()
+        .map(|(pid, name)| format!("0x{pid:04x} ({name})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Whether to use NCM framing (NTB headers) or raw ECM frames.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FramingMode {
@@ -72,22 +93,26 @@ struct FrameCounters {
 
 /// Connect to the XReal One IMU via USB CDC NCM/ECM.
 pub fn connect_usb() -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
-    // 1. Find the XReal One.
+    // 1. Find the XReal One-family glasses.
     let device_info = nusb::list_devices()
         .wait()
         .map_err(|e| anyhow!("Failed to enumerate USB devices: {e}"))?
-        .find(|d| d.vendor_id() == XREAL_VID && d.product_id() == XREAL_PID)
+        .find(|d| d.vendor_id() == XREAL_VID && is_supported_xreal_pid(d.product_id()))
         .ok_or_else(|| {
             anyhow!(
-                "XReal One not found on USB (VID {:04x} PID {:04x})",
+                "XReal One-family device not found on USB (VID {:04x}, supported PIDs: {})",
                 XREAL_VID,
-                XREAL_PID
+                supported_pid_list()
             )
         })?;
 
+    let product_id = device_info.product_id();
     tracing::info!(
+        vid = format!("0x{:04x}", XREAL_VID),
+        pid = format!("0x{:04x}", product_id),
+        model = xreal_product_name(product_id),
         product_string = ?device_info.product_string(),
-        "Found XReal One USB device"
+        "Found XReal One-family USB device"
     );
 
     // 2. Open the device.

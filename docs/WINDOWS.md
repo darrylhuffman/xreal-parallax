@@ -10,8 +10,11 @@ sizing the stereo eye buffers from the active output surface.
 - The app launches in a desktop window when no XREAL display is detected.
 - If an XREAL/Nreal-named display or common SBS output is present, the app opens
   fullscreen on that display.
-- IMU startup tries the Windows raw USB CDC NCM/ECM path first, then falls back
-  to direct TCP at `169.254.2.1:52998`.
+- IMU startup tries direct TCP at `169.254.2.1:52998` first, then falls back
+  to the Windows raw USB CDC NCM/ECM path if the OS network driver is not
+  exposing the endpoint.
+- XREAL 1S hardware has been observed on Windows as USB VID `3318`, PID `043E`;
+  the app recognizes that PID in the Windows raw USB IMU fallback.
 - Panel hover, drag, resize, curvature, and relative scroll rotation paths are
   wired into the render loop.
 
@@ -40,3 +43,8 @@ powershell -ExecutionPolicy Bypass -File scripts/test-xreal-windows.ps1 -LaunchS
 ```
 
 See [Hardware Test Plan](HARDWARE_TEST_PLAN.md) for the full device checklist.
+
+The diagnostic separates USB/IMU presence from display-output presence. A valid
+1S run can show `xrealUsbDevicePresent = true` and `tcpImu.reachable = true`
+while `candidateDisplayPresent = false` if Windows has not exposed the glasses
+as a named or SBS-sized monitor.

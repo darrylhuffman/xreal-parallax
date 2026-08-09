@@ -44,6 +44,20 @@ function Get-ScreenList {
     }
 }
 
+function Get-XrealUsbProductIds {
+    param([object[]]$Devices)
+
+    $ids = New-Object System.Collections.Generic.List[string]
+    foreach ($device in @($Devices)) {
+        $instanceId = [string]$device.InstanceId
+        if ($instanceId -match "VID_3318&PID_([0-9A-Fa-f]{4})") {
+            $ids.Add($matches[1].ToUpperInvariant())
+        }
+    }
+
+    $ids | Sort-Object -Unique
+}
+
 function Test-TcpPort {
     param(
         [string]$HostName,
@@ -94,13 +108,16 @@ try {
     $exe = Join-Path $repoRoot "target\release\xreal-app.exe"
     $usbDevices = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
         Where-Object {
-            $_.InstanceId -match "VID_3318|PID_0438|XREAL|NREAL" -or
+            $_.InstanceId -match "VID_3318|PID_0438|PID_043E|XREAL|NREAL" -or
             $_.FriendlyName -match "XREAL|Nreal|CDC NCM|CDC ECM"
         } |
         Select-Object Class, FriendlyName, InstanceId, Status
+    $xrealUsbProductIds = @(Get-XrealUsbProductIds -Devices $usbDevices)
 
     $pnpDisplays = Get-PnpDevice -PresentOnly -Class Display -ErrorAction SilentlyContinue |
         Select-Object Class, FriendlyName, InstanceId, Status
+    $candidatePnpDisplays = $pnpDisplays |
+        Where-Object { $_.FriendlyName -match "XREAL|Nreal" -or $_.InstanceId -match "XREAL|NREAL|VID_3318|PID_0438|PID_043E" }
 
     $wmiDisplays = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue |
         ForEach-Object {
@@ -109,12 +126,18 @@ try {
                 instanceName = $_.InstanceName
             }
         }
+    $candidateWmiDisplays = $wmiDisplays |
+        Where-Object { $_.name -match "XREAL|Nreal" -or $_.instanceName -match "XREAL|NREAL|VID_3318|PID_0438|PID_043E" }
 
     $screens = @(Get-ScreenList)
+    $nonPrimaryScreens = $screens | Where-Object { $_.primary -eq $false }
     $candidateScreens = $screens | Where-Object {
         ($_.width -eq 3840 -and ($_.height -eq 1080 -or $_.height -eq 1200)) -or
         ($_.width -eq 1920 -and ($_.height -eq 1080 -or $_.height -eq 1200))
     }
+    $candidateDisplayPresent = (@($candidateScreens).Count -gt 0) -or
+        (@($candidatePnpDisplays).Count -gt 0) -or
+        (@($candidateWmiDisplays).Count -gt 0)
 
     $networkAdapters = Get-NetAdapter -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match "XREAL|Nreal|CDC|NCM|ECM|USB" -or $_.InterfaceDescription -match "XREAL|Nreal|CDC|NCM|ECM|USB" } |
@@ -157,11 +180,16 @@ try {
         gitCommit = (git rev-parse HEAD)
         windowsExe = if (Test-Path $exe) { "$((Resolve-Path $exe))" } else { $null }
         xrealUsbDevicePresent = @($usbDevices).Count -gt 0
-        candidateDisplayPresent = @($candidateScreens).Count -gt 0
+        xrealUsbProductIds = @($xrealUsbProductIds)
+        externalDisplayPresent = @($nonPrimaryScreens).Count -gt 0
+        candidateDisplayPresent = $candidateDisplayPresent
         screens = @($screens)
+        nonPrimaryScreens = @($nonPrimaryScreens)
         candidateScreens = @($candidateScreens)
         pnpDisplays = @($pnpDisplays)
+        candidatePnpDisplays = @($candidatePnpDisplays)
         wmiDisplays = @($wmiDisplays)
+        candidateWmiDisplays = @($candidateWmiDisplays)
         usbDevices = @($usbDevices)
         networkAdapters = @($networkAdapters)
         tcpImu = $tcpImu
@@ -172,6 +200,8 @@ try {
 
     Write-Host "Windows XREAL diagnostics written: $reportPath"
     Write-Host "USB device present: $($report.xrealUsbDevicePresent)"
+    Write-Host "XREAL USB product IDs: $(@($report.xrealUsbProductIds) -join ', ')"
+    Write-Host "Any non-primary display present: $($report.externalDisplayPresent)"
     Write-Host "Candidate display present: $($report.candidateDisplayPresent)"
     Write-Host "IMU TCP reachable: $($report.tcpImu.reachable)"
     if ($processInfo) {

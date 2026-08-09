@@ -18,6 +18,9 @@ powershell -ExecutionPolicy Bypass -File scripts/test-xreal-windows.ps1 -LaunchS
 What the script checks:
 
 - whether Windows sees an XREAL/Nreal USB device
+- which XREAL USB product IDs Windows reports, including the XREAL 1S PID
+  `043E`
+- whether Windows exposes any non-primary display
 - whether Windows exposes a candidate 1920x1080, 1920x1200, 3840x1080, or
   3840x1200 display
 - whether the IMU TCP endpoint at `169.254.2.1:52998` is reachable
